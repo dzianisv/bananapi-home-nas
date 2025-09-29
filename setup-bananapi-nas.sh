@@ -291,9 +291,8 @@ configure_firewall() {
 optimize_system_performance() {
     print_status "Optimizing system performance for NAS operations..."
 
-    # Kernel network optimizations
-    cat >> /etc/sysctl.conf << 'EOF'
-
+    # Create comprehensive kernel optimizations
+    cat > /etc/sysctl.d/99-nas-performance.conf << 'EOF'
 # Network performance optimizations
 net.core.rmem_max = 134217728
 net.core.wmem_max = 134217728
@@ -302,19 +301,38 @@ net.ipv4.tcp_wmem = 4096 65536 134217728
 net.core.netdev_max_backlog = 30000
 net.ipv4.tcp_timestamps = 0
 net.ipv4.tcp_sack = 0
+net.ipv4.tcp_no_metrics_save = 1
+net.ipv4.tcp_congestion_control = htcp
 
 # Disk I/O optimizations
 vm.dirty_ratio = 5
 vm.dirty_background_ratio = 2
 vm.swappiness = 10
+vm.vfs_cache_pressure = 50
+
+# File handle limits
+fs.file-max = 2097152
+fs.nr_open = 1048576
 EOF
 
     # Apply settings immediately
-    sysctl -p
+    sysctl -p /etc/sysctl.d/99-nas-performance.conf
+
+    # Optimize CPU governor for better performance
+    if [ -f /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]; then
+        echo performance > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || \
+        echo ondemand > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null
+        print_success "CPU governor optimized"
+    fi
 
     # Disable unnecessary services that consume CPU
-    systemctl disable --now ModemManager.service 2>/dev/null || true
-    systemctl disable --now bluetooth.service 2>/dev/null || true
+    SERVICES="ModemManager bluetooth snapd"
+    for service in $SERVICES; do
+        if systemctl is-enabled $service 2>/dev/null | grep -q enabled; then
+            systemctl disable --now $service 2>/dev/null || true
+            print_success "Disabled unnecessary service: $service"
+        fi
+    done
 
     # Optimize mount options for external drives
     print_status "Optimizing mount options..."
@@ -326,23 +344,43 @@ EOF
 
 # Check if Dzianis-2 is mounted
 if mount | grep -q "/media/Dzianis-2"; then
+    DEVICE=$(mount | grep "/media/Dzianis-2" | awk '{print $1}')
     umount /media/Dzianis-2 2>/dev/null
-    mount -t exfat -o rw,uid=1000,gid=1000,umask=000,iocharset=utf8,noatime /dev/sdb1 /media/Dzianis-2 2>/dev/null || \
-    mount -t exfat -o rw,uid=1000,gid=1000,umask=000,iocharset=utf8,noatime /dev/sdd1 /media/Dzianis-2 2>/dev/null
+    mount -t exfat -o rw,uid=1000,gid=1000,umask=000,iocharset=utf8,noatime $DEVICE /media/Dzianis-2
 fi
 
 # Check if HDD750GB is mounted
 if mount | grep -q "/media/HDD750GB"; then
+    DEVICE=$(mount | grep "/media/HDD750GB" | awk '{print $1}')
     umount /media/HDD750GB 2>/dev/null
-    mount -o rw,noatime,nodiratime /dev/sde2 /media/HDD750GB 2>/dev/null || \
-    mount -o rw,noatime,nodiratime /dev/sdc1 /media/HDD750GB 2>/dev/null
+    mount -o rw,noatime,nodiratime $DEVICE /media/HDD750GB
 fi
 EOF
 
     chmod +x /usr/local/bin/optimize-mounts.sh
-
-    # Run mount optimization
     /usr/local/bin/optimize-mounts.sh
+
+    # Create performance monitoring script
+    cat > /usr/local/bin/nas-performance-check.sh << 'EOF'
+#!/bin/bash
+echo "=== NAS Performance Check ==="
+echo "Date: $(date)"
+echo ""
+echo "SMB Connections:"
+smbstatus -b 2>/dev/null | grep -E "192.168|10." | head -5
+echo ""
+echo "Disk I/O:"
+iostat -x 1 2 2>/dev/null | tail -n +4 | head -10 || echo "iostat not available"
+echo ""
+echo "Network throughput:"
+ifstat -i end0 1 1 2>/dev/null || ip -s link show end0 | grep -A1 "RX:"
+echo ""
+echo "Top processes:"
+ps aux | sort -nrk 3,3 | head -5
+EOF
+
+    chmod +x /usr/local/bin/nas-performance-check.sh
+    print_success "Performance monitoring script created at /usr/local/bin/nas-performance-check.sh"
 
     print_success "System performance optimized"
 }
@@ -533,6 +571,18 @@ case "${1:-}" in
         ;;
     test)
         create_test_files
+        ;;
+    performance)
+        check_root
+        optimize_system_performance
+        print_success "=== Performance Optimization Complete ==="
+        echo ""
+        print_status "Expected SMB transfer speeds:"
+        echo "  - USB 2.0 drives: 15-25 MB/s"
+        echo "  - USB 3.0 drives: 30-80 MB/s"
+        echo "  - Network limit: ~110 MB/s (Gigabit)"
+        echo ""
+        print_status "To monitor performance, run: nas-performance-check.sh"
         ;;
     *)
         main
