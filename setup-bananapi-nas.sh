@@ -349,11 +349,17 @@ if mount | grep -q "/media/Dzianis-2"; then
     mount -t exfat -o rw,uid=1000,gid=1000,umask=000,iocharset=utf8,noatime $DEVICE /media/Dzianis-2
 fi
 
-# Check if HDD750GB is mounted
+# Check if HDD750GB is mounted (SATA drive)
 if mount | grep -q "/media/HDD750GB"; then
     DEVICE=$(mount | grep "/media/HDD750GB" | awk '{print $1}')
+    FSTYPE=$(mount | grep "/media/HDD750GB" | awk '{print $5}')
     umount /media/HDD750GB 2>/dev/null
-    mount -o rw,noatime,nodiratime $DEVICE /media/HDD750GB
+    # Optimize based on filesystem type
+    if [ "$FSTYPE" = "exfat" ]; then
+        mount -t exfat -o rw,uid=1000,gid=1000,umask=000,iocharset=utf8,noatime $DEVICE /media/HDD750GB
+    else
+        mount -o rw,noatime,nodiratime $DEVICE /media/HDD750GB
+    fi
 fi
 EOF
 
