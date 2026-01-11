@@ -1,0 +1,17 @@
+# Binary images and large files
+*.tar
+*.img
+*.img.gz
+*.bin.gz
+*.dmg
+
+# Sensitive files
+passwd.txt
+*.pem
+*.key
+
+# macOS
+.DS_Store
+
+# Node modules (if any)
+node_modules/

@@ -65,7 +65,10 @@ install_packages() {
         python3-pip \
         wget \
         curl \
-        ufw
+        ufw \
+        minidlna \
+        smartmontools \
+        transmission-daemon
     
     print_success "Packages installed successfully"
 }
@@ -173,11 +176,13 @@ configure_samba() {
    force group = engineer
 
 [Dzianis-2]
-   comment = Dzianis-2 Storage
+   comment = Dzianis-2 Storage (Password Protected)
    path = /media/Dzianis-2
    browseable = yes
    read only = no
-   guest ok = yes
+   guest ok = no
+   public = no
+   valid users = engineer
    create mask = 0664
    directory mask = 0775
    force user = engineer
@@ -188,11 +193,21 @@ configure_samba() {
    allocation roundup size = 4096
 EOF
     
+    # Set up SMB user passwords
+    print_status "Configuring SMB user passwords..."
+
+    # Set system password for engineer user
+    echo "engineer:AHotPotato" | chpasswd
+
+    # Set SMB password for engineer user
+    (echo "AHotPotato"; echo "AHotPotato") | smbpasswd -a -s engineer
+    smbpasswd -e engineer
+
     # Restart Samba services
     systemctl restart smbd nmbd
     systemctl enable smbd nmbd
-    
-    print_success "Samba configured successfully"
+
+    print_success "Samba configured successfully with password protection for Dzianis-2"
 }
 
 # Function to install and configure WSDD for Windows 10/11 discovery
@@ -280,6 +295,9 @@ configure_firewall() {
     # mDNS/Bonjour
     iptables -A INPUT -p udp --dport 5353 -j ACCEPT
     
+    # Transmission web UI
+    iptables -A INPUT -p tcp --dport 9091 -j ACCEPT
+    
     # Save firewall rules
     mkdir -p /etc/iptables
     iptables-save > /etc/iptables/rules.v4
@@ -299,10 +317,11 @@ net.core.wmem_max = 134217728
 net.ipv4.tcp_rmem = 4096 87380 134217728
 net.ipv4.tcp_wmem = 4096 65536 134217728
 net.core.netdev_max_backlog = 30000
-net.ipv4.tcp_timestamps = 0
-net.ipv4.tcp_sack = 0
-net.ipv4.tcp_no_metrics_save = 1
-net.ipv4.tcp_congestion_control = htcp
+# Keep timestamps and SACK enabled for compatibility with modern clients
+net.ipv4.tcp_timestamps = 1
+net.ipv4.tcp_sack = 1
+# Use cubic congestion control (default, well-tested)
+net.ipv4.tcp_congestion_control = cubic
 
 # Disk I/O optimizations
 vm.dirty_ratio = 5
@@ -310,9 +329,9 @@ vm.dirty_background_ratio = 2
 vm.swappiness = 10
 vm.vfs_cache_pressure = 50
 
-# File handle limits
-fs.file-max = 2097152
-fs.nr_open = 1048576
+# File handle limits (using system defaults which are sufficient)
+# fs.file-max = 2097152
+# fs.nr_open = 1048576
 EOF
 
     # Apply settings immediately
@@ -337,34 +356,10 @@ EOF
     # Optimize mount options for external drives
     print_status "Optimizing mount options..."
 
-    # Create mount optimization script
-    cat > /usr/local/bin/optimize-mounts.sh << 'EOF'
-#!/bin/bash
-# Remount external drives with optimized options
-
-# Check if Dzianis-2 is mounted
-if mount | grep -q "/media/Dzianis-2"; then
-    DEVICE=$(mount | grep "/media/Dzianis-2" | awk '{print $1}')
-    umount /media/Dzianis-2 2>/dev/null
-    mount -t exfat -o rw,uid=1000,gid=1000,umask=000,iocharset=utf8,noatime $DEVICE /media/Dzianis-2
-fi
-
-# Check if HDD750GB is mounted (SATA drive)
-if mount | grep -q "/media/HDD750GB"; then
-    DEVICE=$(mount | grep "/media/HDD750GB" | awk '{print $1}')
-    FSTYPE=$(mount | grep "/media/HDD750GB" | awk '{print $5}')
-    umount /media/HDD750GB 2>/dev/null
-    # Optimize based on filesystem type
-    if [ "$FSTYPE" = "exfat" ]; then
-        mount -t exfat -o rw,uid=1000,gid=1000,umask=000,iocharset=utf8,noatime $DEVICE /media/HDD750GB
-    else
-        mount -o rw,noatime,nodiratime $DEVICE /media/HDD750GB
-    fi
-fi
-EOF
-
-    chmod +x /usr/local/bin/optimize-mounts.sh
-    /usr/local/bin/optimize-mounts.sh
+    # Note: Mount optimizations are not applied automatically as they require
+    # careful consideration of filesystem type and can cause issues if misconfigured.
+    # The default mount options used by the system are generally sufficient.
+    # For manual optimization, use: mount -o remount,noatime /media/HDD750GB
 
     # Create performance monitoring script
     cat > /usr/local/bin/nas-performance-check.sh << 'EOF'
@@ -416,6 +411,14 @@ setup_kyocera_printer() {
     modprobe usblp
     echo "usblp" > /etc/modules-load.d/usblp.conf
     
+    # Remove any blacklist for usblp (often created by ipp-usb package)
+    if grep -r "blacklist usblp" /etc/modprobe.d/ /lib/modprobe.d/ /usr/lib/modprobe.d/ 2>/dev/null; then
+        print_warning "Found usblp blacklist, removing..."
+        find /etc/modprobe.d/ /lib/modprobe.d/ /usr/lib/modprobe.d/ -type f -exec grep -l "blacklist usblp" {} \; 2>/dev/null | xargs rm -f
+        update-initramfs -u
+        print_success "Removed usblp blacklist and updated initramfs"
+    fi
+    
     # Create udev rule for printer permissions
     cat > /etc/udev/rules.d/99-lp-permissions.rules << 'EOF'
 KERNEL=="lp*", MODE="0666"
@@ -457,7 +460,6 @@ basedir regex = /home
 
 [HDD750GB]
 path = /media/HDD750GB
-valid users = engineer
 
 [Dzianis-2]
 path = /media/Dzianis-2
@@ -469,6 +471,95 @@ EOF
     systemctl enable netatalk
     
     print_success "Netatalk configured for AFP"
+}
+
+# Function to configure MiniDLNA for media streaming
+configure_minidlna() {
+    print_status "Configuring MiniDLNA for DLNA/UPnP media streaming..."
+    
+    # Create MiniDLNA configuration
+    cat > /etc/minidlna.conf << 'EOF'
+media_dir=/media/HDD750GB
+friendly_name=BananaPi Media Server
+port=8200
+inotify=yes
+notify_interval=900
+serial=12345678
+model_number=1
+root_container=B
+EOF
+    
+    # Add DLNA/UPnP ports to firewall
+    iptables -A INPUT -p tcp --dport 8200 -j ACCEPT
+    iptables -A INPUT -p udp --dport 1900 -j ACCEPT
+    
+    # Enable and start MiniDLNA
+    systemctl enable minidlna
+    systemctl restart minidlna
+    
+    print_success "MiniDLNA configured for media streaming on port 8200"
+}
+
+# Function to configure Transmission torrent client
+configure_transmission() {
+    print_status "Configuring Transmission torrent client..."
+    
+    # Create download directory
+    mkdir -p /media/HDD750GB/Downloads
+    
+    # Stop the service to edit config
+    systemctl stop transmission-daemon
+    
+    # Edit settings.json
+    SETTINGS_FILE="/etc/transmission-daemon/settings.json"
+    
+    # Set download directory
+    sed -i 's|"download-dir": "[^"]*"|"download-dir": "/media/HDD750GB/Downloads"|' "$SETTINGS_FILE"
+    
+    # Enable RPC
+    sed -i 's|"rpc-enabled": false|"rpc-enabled": true|' "$SETTINGS_FILE"
+    
+    # Set RPC port
+    sed -i 's|"rpc-port": [0-9]*|"rpc-port": 9091|' "$SETTINGS_FILE"
+    
+    # Set RPC whitelist
+    sed -i 's|"rpc-whitelist": "[^"]*"|"rpc-whitelist": "127.0.0.1,192.168.*.*"|' "$SETTINGS_FILE"
+    
+    # Enable whitelist
+    sed -i 's|"rpc-whitelist-enabled": false|"rpc-whitelist-enabled": true|' "$SETTINGS_FILE"
+    
+    # Start and enable the service
+    systemctl enable transmission-daemon
+    systemctl start transmission-daemon
+    
+    print_success "Transmission configured for downloads to /media/HDD750GB/Downloads, web UI at http://<IP>:9091"
+}
+
+# Function to setup SATA disk auto-mount
+setup_sata_disk() {
+    print_status "Configuring SATA disk auto-mount..."
+    
+    # Check if SATA disk is present
+    if [ -b "/dev/sda2" ]; then
+        # Create mount point
+        mkdir -p /media/HDD750GB
+        
+        # Check if already mounted
+        if ! mountpoint -q /media/HDD750GB; then
+            # Mount the disk
+            mount -t exfat /dev/sda2 /media/HDD750GB 2>/dev/null || true
+        fi
+        
+        # Add to fstab if not already present
+        if ! grep -q "HDD750GB" /etc/fstab; then
+            echo "UUID=6394-CC61 /media/HDD750GB exfat defaults,nofail 0 0" >> /etc/fstab
+            print_success "Added SATA disk to fstab for auto-mount"
+        fi
+        
+        print_success "SATA disk configured at /media/HDD750GB"
+    else
+        print_warning "SATA disk not detected. If disk is connected, try: echo 1 > /sys/block/sdc/device/delete && echo '0 0 0' > /sys/class/scsi_host/host0/scan"
+    fi
 }
 
 # Function to create mount points and set permissions
@@ -507,14 +598,23 @@ show_status() {
     echo -e "\nCUPS Status:"
     systemctl is-active cups || true
     
+    echo -e "\nMiniDLNA Status:"
+    systemctl is-active minidlna || true
+    
+    echo -e "\nTransmission Status:"
+    systemctl is-active transmission-daemon || true
+    
     echo -e "\nNetwork Shares:"
     smbclient -L localhost -N 2>&1 | grep -E "Disk|IPC" || true
     
     echo -e "\nPrinter Status:"
     lpstat -p 2>/dev/null || echo "No printers configured"
     
+    echo -e "\nStorage Mounts:"
+    df -h | grep -E "HDD750GB|Dzianis-2" || echo "No storage mounted"
+    
     echo -e "\nListening Ports:"
-    ss -tlnp | grep -E "139|445|548|631|5357" | awk '{print $4}' || true
+    ss -tlnp | grep -E "139|445|548|631|5357|8200" | awk '{print $4}' || true
 }
 
 # Function to create test files
@@ -539,10 +639,13 @@ main() {
     
     # Run installation steps
     install_packages
+    setup_sata_disk
     configure_samba
     configure_wsdd
     configure_avahi
     configure_netatalk
+    configure_minidlna
+    configure_transmission
     configure_firewall
     optimize_system_performance
     configure_cups
@@ -558,8 +661,14 @@ main() {
     echo "  Linux:    smb://BANANAPI.local"
     echo ""
     print_status "Available Shares:"
-    echo "  - HDD750GB"
-    echo "  - Dzianis-2"
+    echo "  - HDD750GB (SMB/AFP/DLNA)"
+    echo "  - Dzianis-2 (SMB/AFP)"
+    echo ""
+    print_status "Media Streaming:"
+    echo "  DLNA/UPnP: http://$(hostname -I | awk '{print $1}'):8200"
+    echo ""
+    print_status "Torrent Downloads:"
+    echo "  Web UI: http://$(hostname -I | awk '{print $1}'):9091"
     echo ""
     print_status "Printer Access:"
     echo "  Web Interface: http://$(hostname -I | awk '{print $1}'):631"
